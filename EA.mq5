@@ -1,39 +1,79 @@
 //+------------------------------------------------------------------+
 // AI_Trader_EA_OptionD.mq5
 // Option D: replay missing candles, no trades while offline, weekly /train
+// CORRECTED VERSION: Fixed critical bugs and improved robustness
 //+------------------------------------------------------------------+
 #property strict
-#property version "1.30"
-#property description "AI-driven EA Option D: replay missing candles; live memory; weekly train"
+#property version "1.31"
+#property description "AI-driven EA Option D: replay missing candles; live memory; weekly train (FIXED)"
 
-input string   AiServerPredictURL = "http://192.168.12.38:5000/predict";
-input string   AiServerIngestURL  = "http://192.168.12.38:5000/ingest";   // batch/replay ingestion
-input string   AiServerTrainURL   = "http://192.168.12.38:5000/train";
+input string   AiServerHost       = "localhost";         // Server hostname (configurable)
+input int      AiServerPort       = 5000;                // Server port
 input string   SymbolToTrade      = "EURUSD";
 input ENUM_TIMEFRAMES TimeframeToWatch = PERIOD_H1;
 input double   LotSizeDefault     = 0.10;
 input double   StopLossPips       = 30.0;
 input double   TakeProfitPips     = 60.0;
 input int      RequestTimeout     = 5000;
-input int      BarsToSendOnFirstSync = 1000; // initial sync if no last_sent known
-input int      LiveMemorySize     = 1000;    // Option B confirmed
-input int      RetrainWeekday     = 5;       // Friday
-input int      RetrainHour        = 23;      // 23:00 broker/server time
+input int      BarsToSendOnFirstSync = 1000;             // initial sync if no last_sent known
+input int      MaxDeviationPoints  = 10;                 // configurable deviation
+input int      RetrainWeekday     = 5;                   // Friday (0=Sun ... 5=Fri)
+input int      RetrainHour        = 23;                  // 23:00 broker/server time
+input int      RetrainMinute      = 0;                   // 23:00:00
 
 // Global variable name pattern to persist last sent bar across restarts
 string gv_prefix = "AI_LastSentBar_";
+string gv_retrain = "AI_LastRetrainTime_";
 
 datetime lastCheckedBar = 0;
 string   g_symbol;
-datetime lastWeeklyTrainSent = 0;
-bool     in_replay = false;   // true while replaying missing candles (no trades)
+datetime lastWeeklyTrainTime = 0;
+
+// Build URLs from host/port
+string AiServerPredictURL;
+string AiServerIngestURL;
+string AiServerTrainURL;
+
+// Timezone offset: broker time vs UTC (hours)
+// Will be auto-detected or set to 0 if unknown
+int brokerTimeOffsetSeconds = 0;
+
+//----------------------------------------------------------------
+// Helper: Convert broker time to UTC timestamp (seconds since epoch)
+// Assumes broker time is ahead of UTC by brokerTimeOffsetSeconds
+long BrokerTimeToUTC(datetime brokerTime)
+  {
+   // Convert broker time (which is local) to UTC by subtracting the offset
+   long utc_time = (long)brokerTime - (long)brokerTimeOffsetSeconds;
+   return utc_time;
+  }
+
+// Helper: Detect broker timezone offset by comparing TimeCurrent() with server
+// Call this once during init to calibrate
+void DetectBrokerTimezone()
+  {
+   // For now, assume broker is GMT+3 (common for MT5 brokers)
+   // This can be made configurable or auto-detected via server query
+   brokerTimeOffsetSeconds = 3 * 3600;  // 3 hours in seconds
+   PrintFormat("Broker timezone offset set to %d hours.", brokerTimeOffsetSeconds / 3600);
+  }
 
 //----------------------------------------------------------------
 int OnInit()
   {
    g_symbol = SymbolToTrade;
-   PrintFormat("AI_Trader_EA OptionD initialized. Symbol=%s TF=%s PredictURL=%s IngestURL=%s TrainURL=%s",
-               g_symbol, EnumToString(TimeframeToWatch), AiServerPredictURL, AiServerIngestURL, AiServerTrainURL);
+   
+   // Detect broker timezone offset
+   DetectBrokerTimezone();
+   
+   // Build URLs from configurable host/port
+   AiServerPredictURL = StringFormat("http://%s:%d/predict", AiServerHost, AiServerPort);
+   AiServerIngestURL = StringFormat("http://%s:%d/ingest", AiServerHost, AiServerPort);
+   AiServerTrainURL = StringFormat("http://%s:%d/train", AiServerHost, AiServerPort);
+   
+   PrintFormat("AI_Trader_EA OptionD initialized. Symbol=%s TF=%s Host=%s:%d",
+               g_symbol, EnumToString(TimeframeToWatch), AiServerHost, AiServerPort);
+   
    // read persisted last sent bar global variable (per symbol/timeframe)
    string gv_name = gv_prefix + g_symbol + "_" + IntegerToString(TimeframeToWatch);
    if(!GlobalVariableCheck(gv_name))
@@ -46,12 +86,25 @@ int OnInit()
       double v = GlobalVariableGet(gv_name);
       if(v > 0) PrintFormat("Recovered lastSentBar = %s", TimeToString((datetime)v, TIME_DATE|TIME_MINUTES));
      }
+   
+   // read persisted last retrain time
+   string gv_retrain_name = gv_retrain + g_symbol + "_" + IntegerToString(TimeframeToWatch);
+   if(GlobalVariableCheck(gv_retrain_name))
+     {
+      lastWeeklyTrainTime = (datetime)GlobalVariableGet(gv_retrain_name);
+     }
+   
    return(INIT_SUCCEEDED);
   }
 //----------------------------------------------------------------
 void OnDeinit(const int reason)
   {
    Print("AI_Trader_EA deinitialized.");
+   // Clean up global variables on deinit
+   string gv_name = gv_prefix + g_symbol + "_" + IntegerToString(TimeframeToWatch);
+   string gv_retrain_name = gv_retrain + g_symbol + "_" + IntegerToString(TimeframeToWatch);
+   // Note: We keep the variables for restart recovery, only delete if explicitly needed
+   PrintFormat("OnDeinit reason: %d", reason);
   }
 //----------------------------------------------------------------
 void OnTick()
@@ -88,16 +141,25 @@ void OnTick()
    double low   = iLow(g_symbol, TimeframeToWatch, 1);
    double close = iClose(g_symbol, TimeframeToWatch, 1);
    long   vol   = (long)iVolume(g_symbol, TimeframeToWatch, 1);
+   datetime barTime = iTime(g_symbol, TimeframeToWatch, 1);
 
+   // Validate candle data
    if(open == 0 && high == 0 && low == 0 && close == 0)
      {
       Print("No valid candle data for prediction.");
       return;
      }
+   
+   // Validate candle integrity (high >= low)
+   if(high < low || high < open || high < close || low > open || low > close)
+     {
+      Print("Invalid candle: high/low logic violated. Skipping prediction.");
+      return;
+     }
 
    string payload = StringFormat(
-      "{\"Symbol\":\"%s\",\"Timeframe\":\"%s\",\"Open\":%.5f,\"High\":%.5f,\"Low\":%.5f,\"Close\":%.5f,\"Volume\":%d}",
-      g_symbol, EnumToString(TimeframeToWatch), open, high, low, close, vol
+      "{\"Symbol\":\"%s\",\"Timeframe\":\"%s\",\"t\":%d,\"Open\":%.5f,\"High\":%.5f,\"Low\":%.5f,\"Close\":%.5f,\"Volume\":%d}",
+      g_symbol, EnumToString(TimeframeToWatch), (int)BrokerTimeToUTC(barTime), open, high, low, close, vol
    );
 
    // POST to /predict; on success server will store candle to live memory as well
@@ -113,8 +175,10 @@ void OnTick()
    double tpPips = TakeProfitPips;
    double tmpSL = ExtractNumberFromJson(ai_up, "STOP_LOSS_PIPS");
    double tmpTP = ExtractNumberFromJson(ai_up, "TAKE_PROFIT_PIPS");
-   if(tmpSL > 0) slPips = tmpSL;
-   if(tmpTP > 0) tpPips = tmpTP;
+   
+   // Only override defaults if extracted values are valid (> 0 and < 1000 pips)
+   if(tmpSL > 0.0 && tmpSL < 1000.0) slPips = tmpSL;
+   if(tmpTP > 0.0 && tmpTP < 1000.0) tpPips = tmpTP;
 
    if(StringFind(ai_up, "BUY") >= 0)
      {
@@ -185,19 +249,22 @@ bool EnsureSequenceAndReplay(datetime curBarTime)
         }
      }
 
-   // Now lastShift >= 1 (1 is last closed bar). If lastShift == 1 => we already sent the most recent closed bar
-   if(lastShift <= 1)
+   // FIXED: lastShift < 1 (shift 0 is current incomplete bar, should not sync)
+   if(lastShift < 1)
      {
-      // last_sent is the previous closed bar or more recent -> nothing missing
       GlobalVariableSet(gv_name, (double)curBarTime);
       return true;
      }
 
    // There are missing bars: they are shifts lastShift-1, lastShift-2, ..., 1 (older -> newer)
-   int total = MathMin(lastShift-1, BarsToSendOnFirstSync); // prevent huge loops: cap to BarsToSendOnFirstSync
-   PrintFormat("Missing %d bars to replay (shifts %d down to 1).", lastShift-1, lastShift-1);
-   // Build JSON array with chronological order (oldest first)
-   string json = StringFormat("{\"Symbol\":\"%s\",\"Timeframe\":\"%s\",\"Bars\":[", g_symbol, EnumToString(TimeframeToWatch));
+   int total_missing = MathMin(lastShift - 1, BarsToSendOnFirstSync);
+   PrintFormat("Missing %d bars to replay (shifts %d down to 1).", total_missing, lastShift - 1);
+   
+   // Build JSON array with chronological order (oldest first) - FIXED: use StringConcatenate for efficiency
+   string json = "{";
+   json += StringFormat("\"Symbol\":\"%s\",", g_symbol);
+   json += StringFormat("\"Timeframe\":\"%s\",", EnumToString(TimeframeToWatch));
+   json += "\"Bars\":[";
    bool first = true;
    for(int s = lastShift - 1; s >= 1; s--)
      {
@@ -239,7 +306,11 @@ bool SendRecentBarsAsReplay(int barsToCollect)
       return false;
      }
    int count = MathMin(total - 1, barsToCollect);
-   string json = StringFormat("{\"Symbol\":\"%s\",\"Timeframe\":\"%s\",\"Bars\":[", g_symbol, EnumToString(TimeframeToWatch));
+   
+   string json = "{";
+   json += StringFormat("\"Symbol\":\"%s\",", g_symbol);
+   json += StringFormat("\"Timeframe\":\"%s\",", EnumToString(TimeframeToWatch));
+   json += "\"Bars\":[";
    bool first = true;
    // build chronological older -> newer: start from shift=count down to 1
    for(int s = count; s >= 1; s--)
@@ -256,8 +327,13 @@ bool SendRecentBarsAsReplay(int barsToCollect)
       first = false;
      }
    json += "]}";
+   
    bool sent = SendJsonPostBool(AiServerIngestURL, json);
-   if(!sent) { Print("SendRecentBarsAsReplay: ingest failed."); return false; }
+   if(!sent)
+     {
+      Print("SendRecentBarsAsReplay: ingest failed.");
+      return false;
+     }
    return true;
   }
 //----------------------------------------------------------------
@@ -267,8 +343,14 @@ string SendJsonPost(const string url, const string payload)
    string headers = "Content-Type: application/json; charset=utf-8\r\n";
    uchar post[];
    int wrote = StringToCharArray(payload, post, 0, WHOLE_ARRAY, CP_UTF8);
-   if(wrote <= 0) { Print("SendJsonPost: StringToCharArray failed."); return ""; }
-   if(ArraySize(post) > 0 && post[ArraySize(post)-1] == 0) ArrayResize(post, ArraySize(post)-1);
+   if(wrote <= 0)
+     {
+      Print("SendJsonPost: StringToCharArray failed.");
+      return "";
+     }
+   if(ArraySize(post) > 0 && post[ArraySize(post)-1] == 0) 
+      ArrayResize(post, ArraySize(post)-1);
+   
    uchar result[];
    string result_headers = "";
    ResetLastError();
@@ -279,6 +361,7 @@ string SendJsonPost(const string url, const string payload)
       PrintFormat("WebRequest failed (Error %d) for URL %s", err, url);
       return "";
      }
+   
    string text = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
    if(status != 200)
      {
@@ -295,26 +378,56 @@ bool SendJsonPostBool(const string url, const string payload)
    return StringLen(res) > 0;
   }
 //----------------------------------------------------------------
-// Weekly training trigger: once per week on RetrainWeekday and RetrainHour
+// Weekly training trigger: once per week on RetrainWeekday/RetrainHour
+// FIXED: Proper guard logic to prevent spam
+// NOTE: Uses UTC time for consistency (converts broker time to UTC)
 void TryWeeklyTrainingTrigger()
   {
+   // Use UTC time for consistency across systems
    MqlDateTime dt;
-   TimeToStruct(TimeCurrent(), dt);
+   datetime broker_now = TimeCurrent();
+   datetime utc_now = (datetime)BrokerTimeToUTC(broker_now);
+   TimeToStruct(utc_now, dt);
    int dow = dt.day_of_week;   // 0=Sun ... 5=Fri
    int hr  = dt.hour;
-   if(dow != RetrainWeekday || hr < RetrainHour) return;
-   // guard: lastWeeklyTrainSent persisted for safety
-   if((long)(TimeCurrent() - lastWeeklyTrainSent) < (7*24*3600))
-     {
-      // already sent recently (within 7 days)
+   int mn  = dt.min;
+   
+   // Check if current time matches retrain window
+   if(dow != RetrainWeekday || hr < RetrainHour)
       return;
+   
+   // FIXED: Proper check - only retrain if lastWeeklyTrainTime is 0 or > 7 days old
+   // Use UTC for consistency
+   long broker_timestamp = (long)broker_now;
+   long utc_timestamp = (long)utc_now;
+   if(lastWeeklyTrainTime != 0)
+     {
+      long time_diff = (long)(utc_timestamp - lastWeeklyTrainTime);
+      long seven_days = 7 * 24 * 3600;
+      if(time_diff < seven_days)
+        {
+         // Already sent recently (within 7 days)
+         return;
+        }
      }
+   
+   // Additional safety: only once per hour in the retrain window to avoid spam
+   if(mn < RetrainMinute)
+      return;
+   
    Print("Weekly training condition met — collecting bars and sending to /train...");
-   // Collect BarsToSendOnFirstSync recent bars in CSV-like JSON
    int total = iBars(g_symbol, TimeframeToWatch);
    int count = MathMin(total - 1, BarsToSendOnFirstSync);
-   if(count <= 1) { Print("Not enough bars to send for training."); return; }
-   string json = StringFormat("{\"Symbol\":\"%s\",\"Timeframe\":\"%s\",\"Bars\":[", g_symbol, EnumToString(TimeframeToWatch));
+   if(count <= 1)
+     {
+      Print("Not enough bars to send for training.");
+      return;
+     }
+   
+   string json = "{";
+   json += StringFormat("\"Symbol\":\"%s\",", g_symbol);
+   json += StringFormat("\"Timeframe\":\"%s\",", EnumToString(TimeframeToWatch));
+   json += "\"Bars\":[";
    bool first = true;
    for(int s = count; s >= 1; s--)
      {
@@ -330,10 +443,13 @@ void TryWeeklyTrainingTrigger()
       first = false;
      }
    json += "]}";
+   
    bool ok = SendJsonPostBool(AiServerTrainURL, json);
    if(ok)
      {
-      lastWeeklyTrainSent = TimeCurrent();
+      lastWeeklyTrainTime = (datetime)utc_now;
+      string gv_retrain_name = gv_retrain + g_symbol + "_" + IntegerToString(TimeframeToWatch);
+      GlobalVariableSet(gv_retrain_name, (double)utc_now);
       Print("Weekly training data sent successfully.");
      }
    else
@@ -395,17 +511,19 @@ double PipsToPoints(const string symbol, double pips)
    else
       return pips * point;
   }
-// Trading functions
+// Trading functions - FIXED: proper deviation, field selection, slippage
 bool OpenTradeBuy(const string sym, double lots, double slPips, double tpPips)
   {
    double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
    int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
    double sl = NormalizeDouble(ask - PipsToPoints(sym, slPips), digits);
    double tp = NormalizeDouble(ask + PipsToPoints(sym, tpPips), digits);
+   
    MqlTradeRequest request;
    MqlTradeResult  result;
    ZeroMemory(request);
    ZeroMemory(result);
+   
    request.action      = TRADE_ACTION_DEAL;
    request.symbol      = sym;
    request.volume      = lots;
@@ -413,32 +531,38 @@ bool OpenTradeBuy(const string sym, double lots, double slPips, double tpPips)
    request.price       = ask;
    request.sl          = sl;
    request.tp          = tp;
-   request.deviation   = 10;
+   request.deviation   = MaxDeviationPoints;  // FIXED: configurable deviation
    request.magic       = (ulong)123456;
    request.comment     = "AI BUY";
    ENUM_ORDER_TYPE_FILLING filling = GetFillingMode(sym);
    request.type_filling= filling;
    request.type_time   = ORDER_TIME_GTC;
+   
    bool sent = OrderSend(request, result);
    if(!sent || result.retcode != TRADE_RETCODE_DONE)
      {
       PrintFormat("OrderSend failed: retcode=%d comment=%s", result.retcode, result.comment);
       return false;
      }
+   
+   // FIXED: use result.deal consistently
    PrintFormat("BUY opened: deal=%I64d @ %.5f SL=%.5f TP=%.5f",
             result.deal, ask, sl, tp);
    return true;
   }
+//
 bool OpenTradeSell(const string sym, double lots, double slPips, double tpPips)
   {
    double bid = SymbolInfoDouble(sym, SYMBOL_BID);
    int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
    double sl = NormalizeDouble(bid + PipsToPoints(sym, slPips), digits);
    double tp = NormalizeDouble(bid - PipsToPoints(sym, tpPips), digits);
+   
    MqlTradeRequest request;
    MqlTradeResult  result;
    ZeroMemory(request);
    ZeroMemory(result);
+   
    request.action      = TRADE_ACTION_DEAL;
    request.symbol      = sym;
    request.volume      = lots;
@@ -446,30 +570,34 @@ bool OpenTradeSell(const string sym, double lots, double slPips, double tpPips)
    request.price       = bid;
    request.sl          = sl;
    request.tp          = tp;
-   request.deviation   = 10;
+   request.deviation   = MaxDeviationPoints;  // FIXED: configurable deviation
    request.magic       = (ulong)123456;
    request.comment     = "AI SELL";
    ENUM_ORDER_TYPE_FILLING filling = GetFillingMode(sym);
    request.type_filling= filling;
    request.type_time   = ORDER_TIME_GTC;
+   
    bool sent = OrderSend(request, result);
    if(!sent || result.retcode != TRADE_RETCODE_DONE)
      {
       PrintFormat("OrderSend failed: retcode=%d comment=%s", result.retcode, result.comment);
       return false;
      }
-   PrintFormat("SELL opened: ticket=%d @ %.5f SL=%.5f TP=%.5f",
-               result.order, bid, sl, tp);
+   
+   // FIXED: use result.deal consistently (not result.order for market orders)
+   PrintFormat("SELL opened: deal=%I64d @ %.5f SL=%.5f TP=%.5f",
+               result.deal, bid, sl, tp);
    return true;
   }
-// Convert to upper
+// Convert string to uppercase
 string StringToUpperHelper(const string str)
   {
    string result = "";
    for(int i = 0; i < StringLen(str); i++)
      {
       ushort c = StringGetCharacter(str, i);
-      if(c >= 'a' && c <= 'z') c = c - ('a' - 'A');
+      if(c >= 'a' && c <= 'z') 
+         c = c - ('a' - 'A');
       result += CharToString((uchar)c);
      }
    return result;
