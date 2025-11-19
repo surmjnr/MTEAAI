@@ -14,6 +14,7 @@ import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, roc_auc_score
 from joblib import dump, load
 
 # ----------------- Configuration -----------------
@@ -49,6 +50,7 @@ ENSEMBLE_WEIGHTS = {"short":0.5, "mid":0.3, "long":0.2}
 MIN_ROWS_FOR_RETRAIN = 200
 RETRAIN_LOCK = threading.Lock()
 METADATA_FILE = os.path.join(MODEL_FOLDER, "metadata.json")
+INCREMENTAL_RETRAIN = True  # if True, only retrain on data since metadata.last_retrain when present
 print("[DEBUG] METADATA_FILE =", METADATA_FILE)
 RETRAIN_LOG = os.path.join(MODEL_FOLDER, "retrain_log.txt")
 
@@ -135,10 +137,21 @@ def load_master_df_all():
     dfs = []
     for f in files:
         try:
-            df = pd.read_csv(os.path.join(DATA_FOLDER, f), parse_dates=['time'])
+            path = os.path.join(DATA_FOLDER, f)
+            df = pd.read_csv(path, parse_dates=['time'])
             cols = [c.lower() for c in df.columns]
             if 'time' in cols and 'open' in cols:
                 df = df[['time','open','high','low','close','volume']].copy()
+                # Infer timeframe from filename (right-most underscore token)
+                name, _ = os.path.splitext(f)
+                if '_' in name:
+                    parts = name.rsplit('_', 1)
+                    tf_candidate = parts[1]
+                else:
+                    tf_candidate = 'unknown'
+                # Normalize timeframe string (upper)
+                timeframe = str(tf_candidate).upper()
+                df['timeframe'] = timeframe
                 dfs.append(df)
         except Exception as e:
             log(f"load_master_df_all skip {f}: {e}")
@@ -146,7 +159,7 @@ def load_master_df_all():
         return pd.DataFrame()
     master = pd.concat(dfs, ignore_index=True)
     master.drop_duplicates(subset=['time','open','high','low','close'], inplace=True)
-    master.sort_values('time', inplace=True)
+    master.sort_values(['time','timeframe'], inplace=True)
     return master
 
 # ----------------- Features & training -----------------
@@ -179,13 +192,37 @@ def train_models():
         if master.empty or len(master) < MIN_ROWS_FOR_RETRAIN:
             log(f"Insufficient data for retrain (rows={len(master)}).")
             return {"status":"insufficient", "rows": len(master)}
+
+        # Optionally perform incremental retrain using metadata last_retrain timestamp
+        if INCREMENTAL_RETRAIN and os.path.exists(METADATA_FILE):
+            try:
+                with open(METADATA_FILE, 'r') as mf:
+                    meta = json.load(mf)
+                last_retrain = meta.get('last_retrain')
+                if last_retrain:
+                    try:
+                        last_dt = datetime.strptime(last_retrain, "%Y-%m-%d %H:%M:%S")
+                        master = master[master['time'] >= last_dt]
+                        log(f"Performing incremental retrain on rows since {last_retrain} (rows={len(master)})")
+                    except Exception:
+                        log("Could not parse last_retrain in metadata; full retrain will proceed.")
+            except Exception:
+                pass
+
         df = feature_engineer(master)
-        df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
+        # Compute target within each timeframe to avoid look-ahead across different TF files
+        try:
+            df = df.sort_values(['time','timeframe'])
+            df['target'] = df.groupby('timeframe')['close'].shift(-1) > df['close']
+            df['target'] = df['target'].astype(int)
+        except Exception:
+            # Fallback: compute global next-close target (legacy behavior)
+            df['target'] = (df['close'].shift(-1) > df['close']).astype(int)
         df.dropna(inplace=True)
         now = datetime.utcnow()
         results = {}
 
-        # horizons definition
+        # horizons definition (keep existing ensemble horizons but evaluate metrics)
         horizons = {'short':365, 'mid':365*5, 'long':365*25}
         for horizon, days in horizons.items():
             if horizon == 'long':
@@ -198,10 +235,37 @@ def train_models():
                 continue
             X = df_h[['open','high','low','close','ma_5','ma_20','return']].values
             y = df_h['target'].values
+            # simple time-based holdout: last 5% rows (min 100) as validation
+            val_size = max(100, int(0.05 * len(X)))
+            if val_size >= len(X):
+                X_train, y_train = X, y
+                X_val, y_val = None, None
+            else:
+                X_train, X_val = X[:-val_size], X[-val_size:]
+                y_train, y_val = y[:-val_size], y[-val_size:]
+
             scaler = StandardScaler()
-            Xs = scaler.fit_transform(X)
+            Xs_train = scaler.fit_transform(X_train)
             model = RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1)
-            model.fit(Xs, y)
+            model.fit(Xs_train, y_train)
+
+            # evaluate on holdout if available
+            metrics = {}
+            if X_val is not None and len(X_val) > 0:
+                try:
+                    Xs_val = scaler.transform(X_val)
+                    preds = model.predict(Xs_val)
+                    probs = model.predict_proba(Xs_val)[:, 1]
+                    acc = float(accuracy_score(y_val, preds))
+                    metrics['accuracy'] = acc
+                    try:
+                        auc = float(roc_auc_score(y_val, probs))
+                        metrics['roc_auc'] = auc
+                    except Exception:
+                        metrics['roc_auc'] = None
+                except Exception as e:
+                    log(f"Evaluation failed for horizon {horizon}: {e}")
+
             # atomic save
             tmp_model = MODEL_FILES_ENSEMBLE[horizon] + '.tmp'
             tmp_scaler = SCALER_FILES_ENSEMBLE[horizon] + '.tmp'
@@ -213,10 +277,10 @@ def train_models():
                 shutil.copy2(MODEL_FILES_ENSEMBLE[horizon], bak)
             os.replace(tmp_model, MODEL_FILES_ENSEMBLE[horizon])
             os.replace(tmp_scaler, SCALER_FILES_ENSEMBLE[horizon])
-            results[horizon] = {'rows': len(df_h)}
-            log(f"Trained {horizon} with {len(df_h)} rows.")
-        # write metadata
-        meta = {"last_retrain": now.strftime("%Y-%m-%d %H:%M:%S"), "rows_total": len(df)}
+            results[horizon] = {'rows': len(df_h), 'metrics': metrics}
+            log(f"Trained {horizon} with {len(df_h)} rows. metrics={metrics}")
+        # write metadata (include per-horizon results/metrics)
+        meta = {"last_retrain": now.strftime("%Y-%m-%d %H:%M:%S"), "rows_total": len(df), "results": results}
         try:
             with open(METADATA_FILE, "w") as f:
                 json.dump(meta, f, indent=2)
@@ -225,10 +289,10 @@ def train_models():
         # reload models
         load_models_if_needed(force=True)
         log("Retrain finished.")
-        # append retrain log
+        # append retrain log with metrics
         try:
             with open(RETRAIN_LOG, "a") as f:
-                f.write(f"{datetime.utcnow().isoformat()} - retrain complete - rows={len(df)}\n")
+                f.write(f"{datetime.utcnow().isoformat()} - retrain complete - rows={len(df)} - results={json.dumps(results)}\n")
         except Exception as e:
             log(f"Failed to write retrain log: {e}")
         log("Retrain finished.")
